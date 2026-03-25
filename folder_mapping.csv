@@ -1,0 +1,14 @@
+source_prefix,target_prefix
+finance/invoices,Finance/AP-Invoices
+finance/receipts,Finance/AP-Invoices/Receipts
+finance/old-archive,Finance/Archive
+hr/policies-legacy,HR/Policies/Archive
+hr/onboarding,HR/Onboarding
+marketing/campaigns-2020,Marketing/Archive/2020
+marketing/campaigns-2021,Marketing/Archive/2021
+marketing/active,Marketing/Active-Campaigns
+legal/contracts-signed,Legal/Contracts/Executed
+legal/drafts,Legal/Contracts/Drafts
+it/runbooks-old,IT/Runbooks/Archive
+shared/templates,Shared/Templates
+shared/old-forms,
