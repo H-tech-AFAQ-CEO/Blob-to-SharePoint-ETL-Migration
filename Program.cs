@@ -210,8 +210,12 @@ public class Program
         var blobServiceClient = new BlobServiceClient(config.StorageConnectionString);
         var containerClient = blobServiceClient.GetBlobContainerClient(config.SourceContainerName);
 
+        var fileCount = 0;
         await foreach (var blobItem in containerClient.GetBlobsAsync())
         {
+            if (fileCount >= 2) // Limit to 2 files for PoC
+                break;
+                
             var extension = Path.GetExtension(blobItem.Name).ToLowerInvariant();
             if (supportedExtensions.Contains(extension))
             {
@@ -228,9 +232,12 @@ public class Program
                     ModifiedOn = properties.Value.LastModified.UtcDateTime,
                     Status = FileStatus.Pending
                 });
+                
+                fileCount++;
             }
         }
 
+        _logger!.LogInformation($"PoC: Limited to {files.Count} files for testing");
         return files;
     }
 
@@ -325,7 +332,7 @@ public class Program
         await stagingContainer.CreateIfNotExistsAsync();
         
         var stagedFiles = new List<BlobFileInfo>();
-        var batchSize = 500; // High-performance batch size for Migration API
+        var batchSize = 2; // PoC: Small batch size for testing
         var currentBatch = new List<BlobFileInfo>();
         var packageCounter = 1;
         
@@ -358,7 +365,7 @@ public class Program
             stagedFiles.AddRange(currentBatch);
         }
         
-        _logger!.LogInformation($"Staged {stagedFiles.Count} files into {packageCounter - 1} packages");
+        _logger!.LogInformation($"PoC: Staged {stagedFiles.Count} files into {packageCounter - 1} packages");
     }
 
     private static async Task ProcessBatchAsync(List<BlobFileInfo> batch, string packageId, BlobServiceClient blobServiceClient, Configuration config)
@@ -556,14 +563,24 @@ public class Program
         
         sasBuilder.SetPermissions(BlobContainerSasPermissions.Read | BlobContainerSasPermissions.List);
         
-        // Get storage account key for SAS generation
-        var storageAccountKey = blobServiceClient.GetBlobContainerClient(config.SourceContainerName)
-            .GetParentBlobServiceClient()
-            .GetAccountKey()
-            .Value;
+        // Extract account key from connection string
+        var connectionStringParts = config.StorageConnectionString.Split(';');
+        var accountKey = "";
+        var accountName = "";
+        
+        foreach (var part in connectionStringParts)
+        {
+            if (part.StartsWith("AccountKey=", StringComparison.OrdinalIgnoreCase))
+                accountKey = part.Substring("AccountKey=".Length);
+            else if (part.StartsWith("AccountName=", StringComparison.OrdinalIgnoreCase))
+                accountName = part.Substring("AccountName=".Length);
+        }
+        
+        if (string.IsNullOrEmpty(accountKey) || string.IsNullOrEmpty(accountName))
+            throw new Exception("Could not extract AccountName or AccountKey from connection string");
         
         var sasToken = sasBuilder.ToSasQueryParameters(new StorageSharedKeyCredential(
-            blobServiceClient.AccountName, storageAccountKey)).ToString();
+            accountName, accountKey)).ToString();
         
         var sasUrl = $"{stagingContainer.Uri}?{sasToken}";
         _logger!.LogDebug($"Generated SAS URL for container: {config.StagingContainerName} (valid 48 hours)");
@@ -621,10 +638,10 @@ public class Program
     private static async Task PollMigrationJobAsync(string jobId, string siteId, string token, List<BlobFileInfo> files)
     {
         using var httpClient = new HttpClient();
-        var maxAttempts = 240; // ~2 hours with 30-second intervals for large batches
+        var maxAttempts = 60; // PoC: ~30 minutes with 30-second intervals for testing
         var attempt = 0;
         
-        _logger!.LogInformation($"Starting to poll migration job {jobId} (max {maxAttempts} attempts)");
+        _logger!.LogInformation($"PoC: Starting to poll migration job {jobId} (max {maxAttempts} attempts)");
         
         while (attempt < maxAttempts)
         {
@@ -644,7 +661,7 @@ public class Program
                     var result = JsonSerializer.Deserialize<JsonElement>(responseContent);
                     var status = result.GetProperty("status").GetString();
                     
-                    _logger!.LogInformation($"Job {jobId} status: {status} (Attempt {attempt}/{maxAttempts})");
+                    _logger!.LogInformation($"PoC: Job {jobId} status: {status} (Attempt {attempt}/{maxAttempts})");
                     
                     switch (status)
                     {
@@ -652,7 +669,7 @@ public class Program
                             var completedFiles = result.TryGetProperty("completedItems", out var completedProp) 
                                 ? completedProp.GetInt32() 
                                 : files.Count;
-                            _logger!.LogInformation($"Job {jobId} completed successfully - {completedFiles} files migrated");
+                            _logger!.LogInformation($"PoC: Job {jobId} completed successfully - {completedFiles} files migrated");
                             
                             foreach (var file in files)
                             {
@@ -666,36 +683,36 @@ public class Program
                             var failedItems = result.TryGetProperty("failedItems", out var failedProp) 
                                 ? failedProp.GetInt32() 
                                 : 0;
-                            _logger!.LogError($"Migration job failed: {error} ({failedItems} items failed)");
+                            _logger!.LogError($"PoC: Migration job failed: {error} ({failedItems} items failed)");
                             throw new Exception($"Migration job failed: {error}");
                             
                         case "inProgress":
                             var progress = result.TryGetProperty("progress", out var progressProp) 
                                 ? progressProp.GetInt32() 
                                 : 0;
-                            _logger!.LogDebug($"Job {jobId} in progress: {progress}%");
+                            _logger!.LogDebug($"PoC: Job {jobId} in progress: {progress}%");
                             continue;
                             
                         default:
-                            _logger!.LogWarning($"Unknown job status: {status}");
+                            _logger!.LogWarning($"PoC: Unknown job status: {status}");
                             continue;
                     }
                 }
                 else
                 {
-                    _logger!.LogWarning($"Failed to poll job status: {response.StatusCode} - {responseContent}");
+                    _logger!.LogWarning($"PoC: Failed to poll job status: {response.StatusCode} - {responseContent}");
                 }
             }
             catch (Exception ex)
             {
-                _logger!.LogError(ex, $"Error polling migration job (Attempt {attempt}/{maxAttempts})");
+                _logger!.LogError(ex, $"PoC: Error polling migration job (Attempt {attempt}/{maxAttempts})");
                 if (attempt >= maxAttempts)
                     throw;
                 
                 // Don't throw on transient errors, continue polling
                 if (ex is HttpRequestException || ex is TaskCanceledException)
                 {
-                    _logger!.LogWarning($"Transient error polling job, continuing...");
+                    _logger!.LogWarning($"PoC: Transient error polling job, continuing...");
                     continue;
                 }
                 else
@@ -705,7 +722,7 @@ public class Program
             }
         }
         
-        throw new TimeoutException($"Migration job {jobId} did not complete within {maxAttempts * 30} seconds (2 hours)");
+        throw new TimeoutException($"PoC: Migration job {jobId} did not complete within {maxAttempts * 30} seconds (30 minutes)");
     }
 
     private static string ComputeFileHash(BlobFileInfo file)
