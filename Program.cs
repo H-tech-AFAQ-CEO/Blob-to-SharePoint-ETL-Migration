@@ -33,13 +33,19 @@ public class Program
             
             var dryRunOption = new Option<bool>("--dry-run", "Preview path mappings without importing");
             var testAuthOption = new Option<bool>("--test-auth", "Test SharePoint authentication only");
+            var simulateOption = new Option<bool>("--simulate", "Simulate ultra-high performance migration with 1000 test files");
             
             rootCommand.AddOption(dryRunOption);
             rootCommand.AddOption(testAuthOption);
+            rootCommand.AddOption(simulateOption);
 
-            rootCommand.SetHandler(async (bool dryRun, bool testAuth) =>
+            rootCommand.SetHandler(async (bool dryRun, bool testAuth, bool simulate) =>
             {
-                if (testAuth)
+                if (simulate)
+                {
+                    await SimulateUltraHighPerformanceAsync();
+                }
+                else if (testAuth)
                 {
                     await TestAuthenticationAsync();
                 }
@@ -47,7 +53,7 @@ public class Program
                 {
                     await RunPipelineAsync(dryRun);
                 }
-            }, dryRunOption, testAuthOption);
+            }, dryRunOption, testAuthOption, simulateOption);
 
             return await rootCommand.InvokeAsync(args);
         }
@@ -56,6 +62,139 @@ public class Program
             _logger?.LogError(ex, "Application failed");
             return 1;
         }
+    }
+
+    private static async Task SimulateUltraHighPerformanceAsync()
+    {
+        _logger!.LogInformation("=========================================");
+        _logger!.LogInformation("Ultra-High Performance Simulation (1000 Files)");
+        _logger!.LogInformation("=========================================");
+
+        var config = new Configuration
+        {
+            UseUltraHighPerformanceMode = true,
+            BatchSize = 1000,
+            MaxConcurrency = Environment.ProcessorCount * 50,
+            MaxParallelBatches = 20,
+            CopyPollingIntervalMs = 100,
+            TargetFilesPerSecond = 28
+        };
+
+        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Simulate 1000 files
+        var files = Enumerable.Range(1, 1000).Select(i => new BlobFileInfo
+        {
+            SourcePath = $"test_folder/file_{i:D4}.pdf",
+            FileName = $"file_{i:D4}.pdf",
+            Extension = ".pdf",
+            SizeBytes = 1024 * 1024, // 1MB each
+            CreatedOn = DateTime.UtcNow.AddDays(-Random.Shared.Next(1, 365)),
+            ModifiedOn = DateTime.UtcNow.AddDays(-Random.Shared.Next(1, 30)),
+            Status = FileStatus.Pending,
+            StagingStartTime = DateTime.UtcNow
+        }).ToList();
+
+        _logger!.LogInformation($"Created {files.Count:N0} test files for simulation");
+
+        // Stage 1: Ultra-High Performance Staging Simulation
+        _logger!.LogInformation("[Stage 1/2] Ultra-High Performance Staging Simulation...");
+        var stagingStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        var batchSize = config.BatchSize;
+        var maxConcurrency = config.MaxConcurrency;
+        var semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+        
+        var stagingTasks = files.Select(async (file, index) =>
+        {
+            await semaphore.WaitAsync();
+            try
+            {
+                var fileStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                
+                // Simulate staging time (50-150ms)
+                var stagingTime = Random.Shared.Next(50, 150);
+                await Task.Delay(stagingTime);
+                
+                fileStopwatch.Stop();
+                file.StagingEndTime = DateTime.UtcNow;
+                file.Status = FileStatus.Staged;
+                file.PackageId = "1";
+                file.StagedBlobPath = $"1/content/{file.TargetPath}";
+                
+                return file;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        });
+
+        var stagedFiles = await Task.WhenAll(stagingTasks);
+        stagingStopwatch.Stop();
+        
+        var stagingSpeed = stagedFiles.Length / (stagingStopwatch.ElapsedMilliseconds / 1000.0);
+        _logger!.LogInformation($"Staging Complete: {stagedFiles.Length:N0} files in {stagingStopwatch.ElapsedMilliseconds / 1000.0:F1}s");
+        _logger!.LogInformation($"Staging Speed: {stagingSpeed:F1} files/second");
+
+        // Stage 2: Ultra-High Performance Migration Simulation
+        _logger!.LogInformation("[Stage 2/2] Ultra-High Performance Migration Simulation...");
+        var migrationStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Group into batches for migration
+        var batches = stagedFiles.GroupBy(f => f.PackageId).ToList();
+        var migrationTasks = batches.Select(async batch =>
+        {
+            var batchFiles = batch.ToList();
+            var batchStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            
+            // Simulate migration time (5-15 seconds per batch)
+            var migrationTime = Random.Shared.Next(5000, 15000);
+            await Task.Delay(migrationTime);
+            
+            batchStopwatch.Stop();
+            
+            foreach (var file in batchFiles)
+            {
+                file.MigrationStartTime = DateTime.UtcNow;
+                file.MigrationEndTime = DateTime.UtcNow;
+                file.Status = FileStatus.Migrated;
+                file.SharePointUrl = $"https://sharepoint.com/Documents/{file.TargetPath}";
+            }
+            
+            return batchFiles.Count;
+        });
+
+        var migrationResults = await Task.WhenAll(migrationTasks);
+        migrationStopwatch.Stop();
+        
+        totalStopwatch.Stop();
+        
+        var totalMigrated = migrationResults.Sum();
+        var totalSpeed = totalMigrated / (totalStopwatch.ElapsedMilliseconds / 1000.0);
+        var efficiency = (totalSpeed / config.TargetFilesPerSecond) * 100;
+        
+        _logger!.LogInformation("=========================================");
+        _logger!.LogInformation("Ultra-High Performance Simulation Results:");
+        _logger!.LogInformation("=========================================");
+        _logger!.LogInformation($"Total Files: {totalMigrated:N0}");
+        _logger!.LogInformation($"Total Time: {totalStopwatch.ElapsedMilliseconds / 1000.0:F1}s");
+        _logger!.LogInformation($"Overall Speed: {totalSpeed:F1} files/second");
+        _logger!.LogInformation($"Target Speed: {config.TargetFilesPerSecond} files/second");
+        _logger!.LogInformation($"Efficiency: {efficiency:F1}%");
+        _logger!.LogInformation($"Staging Speed: {stagingSpeed:F1} files/second");
+        _logger!.LogInformation($"Concurrency: {maxConcurrency}");
+        _logger!.LogInformation($"Batch Size: {batchSize}");
+        _logger!.LogInformation("=========================================");
+        
+        // Calculate extrapolated performance for 100K and 1M files
+        var timeFor100K = (100000 / totalSpeed) / 3600.0; // hours
+        var timeFor1M = (1000000 / totalSpeed) / 3600.0; // hours
+        
+        _logger!.LogInformation("Extrapolated Performance:");
+        _logger!.LogInformation($"100K files: {timeFor100K:F1} hours");
+        _logger!.LogInformation($"1M files: {timeFor1M:F1} hours");
+        _logger!.LogInformation("=========================================");
     }
 
     private static async Task TestAuthenticationAsync()
