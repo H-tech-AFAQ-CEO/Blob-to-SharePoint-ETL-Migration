@@ -323,7 +323,7 @@ public class Program
 
     private static async Task StageFilesAsync(List<BlobFileInfo> files, Configuration config)
     {
-        _logger!.LogInformation("[Stage 3/4] Staging files to Azure Blob container...");
+        _logger!.LogInformation("[Stage 3/4] Starting ultra-high performance staging...");
         
         var blobServiceClient = new BlobServiceClient(config.StorageConnectionString);
         var stagingContainer = blobServiceClient.GetBlobContainerClient(config.StagingContainerName);
@@ -332,94 +332,107 @@ public class Program
         await stagingContainer.CreateIfNotExistsAsync();
         
         var stagedFiles = new List<BlobFileInfo>();
-        var batchSize = 2; // PoC: Small batch size for testing
+        var batchSize = config.UseUltraHighPerformanceMode ? config.BatchSize : 2;
+        var maxParallelBatches = config.UseUltraHighPerformanceMode ? config.MaxParallelBatches : 1;
+        
+        _logger!.LogInformation($"Ultra-High Performance Mode: {batchSize:N0} files/batch, {maxParallelBatches} parallel batches");
+        
+        // Create batch packages
+        var batches = new List<List<BlobFileInfo>>();
         var currentBatch = new List<BlobFileInfo>();
         var packageCounter = 1;
         
         foreach (var file in files.Where(f => f.Status == FileStatus.Pending))
         {
+            currentBatch.Add(file);
+            if (currentBatch.Count >= batchSize)
+            {
+                batches.Add(new List<BlobFileInfo>(currentBatch));
+                currentBatch.Clear();
+            }
+        }
+        
+        if (currentBatch.Any())
+            batches.Add(currentBatch);
+        
+        _logger!.LogInformation($"Created {batches.Count:N0} batches for {files.Count:N0} files");
+        
+        // Process batches in parallel with controlled concurrency
+        var batchSemaphore = new SemaphoreSlim(maxParallelBatches, maxParallelBatches);
+        var batchTasks = batches.Select(async (batch, index) =>
+        {
+            await batchSemaphore.WaitAsync();
             try
             {
-                // Create batch packages
-                if (currentBatch.Count >= batchSize)
-                {
-                    await ProcessBatchAsync(currentBatch, packageCounter++.ToString(), blobServiceClient, config);
-                    stagedFiles.AddRange(currentBatch);
-                    currentBatch.Clear();
-                }
-                
-                currentBatch.Add(file);
+                var packageId = (index + 1).ToString();
+                await ProcessBatchUltraHighPerformanceAsync(batch, packageId, blobServiceClient, config);
+                return batch.Count;
             }
-            catch (Exception ex)
+            finally
             {
-                _logger!.LogError(ex, $"Failed to stage file: {file.FileName}");
-                file.Status = FileStatus.Error;
-                file.ErrorMessage = ex.Message;
+                batchSemaphore.Release();
             }
-        }
+        });
         
-        // Process remaining files in last batch
-        if (currentBatch.Any())
-        {
-            await ProcessBatchAsync(currentBatch, packageCounter++.ToString(), blobServiceClient, config);
-            stagedFiles.AddRange(currentBatch);
-        }
+        var results = await Task.WhenAll(batchTasks);
+        stagedFiles.AddRange(files.Where(f => f.Status == FileStatus.Staged));
         
-        _logger!.LogInformation($"PoC: Staged {stagedFiles.Count} files into {packageCounter - 1} packages");
+        _logger!.LogInformation($"Ultra-High Performance Staging Complete: {stagedFiles.Count:N0} files staged in {batches.Count:N0} batches");
     }
 
-    private static async Task ProcessBatchAsync(List<BlobFileInfo> batch, string packageId, BlobServiceClient blobServiceClient, Configuration config)
+    private static async Task ProcessBatchUltraHighPerformanceAsync(List<BlobFileInfo> batch, string packageId, BlobServiceClient blobServiceClient, Configuration config)
     {
         var packagePath = $"{packageId}/content";
         var stagingContainer = blobServiceClient.GetBlobContainerClient(config.StagingContainerName);
         
-        _logger!.LogInformation($"Processing high-performance batch {packageId} with {batch.Count} files...");
+        _logger!.LogInformation($"Ultra-High Performance Batch {packageId}: {batch.Count:N0} files...");
         
-        // Configure parallel processing for optimal performance
-        var maxConcurrency = Math.Min(batch.Count, Environment.ProcessorCount * 2);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Ultra-high performance parallelization
+        var maxConcurrency = config.UseUltraHighPerformanceMode ? config.MaxConcurrency : Math.Min(batch.Count, Environment.ProcessorCount * 2);
         var semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
         
-        var copyTasks = batch.Select(async file =>
+        // Pre-create all blob clients to avoid repeated overhead
+        var sourceContainer = blobServiceClient.GetBlobContainerClient(config.SourceContainerName);
+        var copyOperations = batch.Select(async file =>
         {
             await semaphore.WaitAsync();
             try
             {
-                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var fileStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 
-                // Copy file from source to staging container
-                var sourceContainer = blobServiceClient.GetBlobContainerClient(config.SourceContainerName);
                 var sourceBlob = sourceContainer.GetBlobClient(file.SourcePath);
                 var stagingBlob = stagingContainer.GetBlobClient($"{packagePath}/{file.TargetPath}");
                 
-                _logger!.LogDebug($"Staging: {file.SourcePath} -> {packagePath}/{file.TargetPath}");
-                
-                // Copy the blob with high-performance settings
+                // Start copy operation immediately (no delays)
                 await stagingBlob.StartCopyFromUriAsync(sourceBlob.Uri);
                 
-                // Wait for copy to complete with timeout
+                // Optimized polling with configurable interval
                 var copyStatus = CopyStatus.Pending;
                 var attempts = 0;
-                var maxAttempts = 120; // 2 minutes max wait per file
+                var maxAttempts = 60; // Reduced max attempts for faster processing
+                var pollingInterval = config.CopyPollingIntervalMs;
                 
                 while (copyStatus == CopyStatus.Pending && attempts < maxAttempts)
                 {
-                    await Task.Delay(1000);
+                    await Task.Delay(pollingInterval);
                     var properties = await stagingBlob.GetPropertiesAsync();
                     copyStatus = properties.Value.CopyStatus;
                     attempts++;
                     
-                    // Log progress every 30 seconds
-                    if (attempts % 30 == 0)
+                    // Reduced logging for performance
+                    if (attempts % 20 == 0) // Log every 20 attempts vs 30
                     {
                         _logger!.LogDebug($"Still copying {file.FileName} - attempt {attempts}/{maxAttempts}");
                     }
                 }
                 
-                stopwatch.Stop();
+                fileStopwatch.Stop();
                 
                 if (copyStatus != CopyStatus.Success)
                 {
-                    throw new Exception($"Copy failed with status: {copyStatus} after {attempts} attempts ({stopwatch.ElapsedMilliseconds}ms)");
+                    throw new Exception($"Copy failed with status: {copyStatus} after {attempts} attempts ({fileStopwatch.ElapsedMilliseconds}ms)");
                 }
                 
                 // Update file info
@@ -427,7 +440,6 @@ public class Program
                 file.StagedBlobPath = $"{packagePath}/{file.TargetPath}";
                 file.Status = FileStatus.Staged;
                 
-                _logger!.LogDebug($"Successfully staged {file.FileName} in {stopwatch.ElapsedMilliseconds}ms");
                 return file;
             }
             catch (Exception ex)
@@ -443,17 +455,23 @@ public class Program
             }
         });
         
-        await Task.WhenAll(copyTasks);
+        var results = await Task.WhenAll(copyOperations);
+        stopwatch.Stop();
         
-        var successCount = batch.Count(f => f.Status == FileStatus.Staged);
-        var errorCount = batch.Count(f => f.Status == FileStatus.Error);
+        var successCount = results.Count(f => f.Status == FileStatus.Staged);
+        var errorCount = results.Count(f => f.Status == FileStatus.Error);
+        var filesPerSecond = batch.Count / (stopwatch.ElapsedMilliseconds / 1000.0);
         
-        _logger!.LogInformation($"Batch {packageId} completed: {successCount} succeeded, {errorCount} failed");
+        _logger!.LogInformation($"Ultra-High Performance Batch {packageId} Complete:");
+        _logger!.LogInformation($"  - Files: {successCount:N0} succeeded, {errorCount:N0} failed");
+        _logger!.LogInformation($"  - Time: {stopwatch.ElapsedMilliseconds / 1000.0:F1}s");
+        _logger!.LogInformation($"  - Speed: {filesPerSecond:F1} files/second");
+        _logger!.LogInformation($"  - Concurrency: {maxConcurrency}");
     }
 
     private static async Task MigrateToSharePointAsync(List<BlobFileInfo> files, Configuration config)
     {
-        _logger!.LogInformation("[Stage 4/4] Starting SharePoint Migration API jobs...");
+        _logger!.LogInformation("[Stage 4/4] Starting Ultra-High Performance SharePoint Migration...");
         
         var token = await GetAccessTokenAsync(config);
         var siteId = await GetSiteIdAsync(config, token);
@@ -464,16 +482,25 @@ public class Program
             .GroupBy(f => f.PackageId)
             .ToList();
         
-        _logger!.LogInformation($"Processing {packageGroups.Count} migration packages...");
+        _logger!.LogInformation($"Ultra-High Performance: Processing {packageGroups.Count:N0} migration packages...");
         
-        foreach (var packageGroup in packageGroups)
+        var migrationStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Ultra-high performance parallel migration jobs
+        var maxParallelJobs = config.UseUltraHighPerformanceMode ? config.MaxParallelBatches : 1;
+        var jobSemaphore = new SemaphoreSlim(maxParallelJobs, maxParallelJobs);
+        
+        var migrationTasks = packageGroups.Select(async packageGroup =>
         {
-            var packageId = packageGroup.Key;
-            var packageFiles = packageGroup.ToList();
-            
+            await jobSemaphore.WaitAsync();
             try
             {
-                _logger!.LogInformation($"Processing package {packageId} with {packageFiles.Count} files...");
+                var packageId = packageGroup.Key;
+                var packageFiles = packageGroup.ToList();
+                
+                _logger!.LogInformation($"Ultra-High Performance Migration: Package {packageId} - {packageFiles.Count:N0} files");
+                
+                var packageStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 
                 // Generate migration manifest
                 var manifest = await GenerateMigrationManifestAsync(packageFiles, config);
@@ -485,21 +512,37 @@ public class Program
                 // Submit migration job
                 var jobId = await SubmitMigrationJobAsync(packageId, manifestBlobPath, sasUrl, siteId, token, config);
                 
-                // Poll for job completion
-                await PollMigrationJobAsync(jobId, siteId, token, packageFiles);
+                // Poll for job completion with ultra-high performance settings
+                await PollMigrationJobUltraHighPerformanceAsync(jobId, siteId, token, packageFiles, config);
                 
-                _logger!.LogInformation($"Package {packageId} migration completed successfully");
+                packageStopwatch.Stop();
+                var filesPerSecond = packageFiles.Count / (packageStopwatch.ElapsedMilliseconds / 1000.0);
+                
+                _logger!.LogInformation($"Ultra-High Performance Package {packageId} Complete:");
+                _logger!.LogInformation($"  - Files: {packageFiles.Count:N0}");
+                _logger!.LogInformation($"  - Time: {packageStopwatch.ElapsedMilliseconds / 1000.0:F1}s");
+                _logger!.LogInformation($"  - Speed: {filesPerSecond:F1} files/second");
+                
+                return packageFiles.Count;
             }
-            catch (Exception ex)
+            finally
             {
-                _logger!.LogError(ex, $"Package {packageId} migration failed");
-                foreach (var file in packageFiles)
-                {
-                    file.Status = FileStatus.Error;
-                    file.ErrorMessage = ex.Message;
-                }
+                jobSemaphore.Release();
             }
-        }
+        });
+        
+        var results = await Task.WhenAll(migrationTasks);
+        migrationStopwatch.Stop();
+        
+        var totalMigrated = results.Sum();
+        var overallSpeed = totalMigrated / (migrationStopwatch.ElapsedMilliseconds / 1000.0);
+        
+        _logger!.LogInformation($"Ultra-High Performance Migration Complete:");
+        _logger!.LogInformation($"  - Total Files: {totalMigrated:N0}");
+        _logger!.LogInformation($"  - Total Time: {migrationStopwatch.ElapsedMilliseconds / 1000.0 / 3600.0:F1} hours");
+        _logger!.LogInformation($"  - Overall Speed: {overallSpeed:F1} files/second");
+        _logger!.LogInformation($"  - Target Speed: {config.TargetFilesPerSecond} files/second");
+        _logger!.LogInformation($"  - Efficiency: {(overallSpeed / config.TargetFilesPerSecond * 100):F1}%");
         
         // Generate final report
         await GenerateMigrationReportAsync(files, config);
@@ -635,19 +678,22 @@ public class Program
         return jobId!;
     }
 
-    private static async Task PollMigrationJobAsync(string jobId, string siteId, string token, List<BlobFileInfo> files)
+    private static async Task PollMigrationJobUltraHighPerformanceAsync(string jobId, string siteId, string token, List<BlobFileInfo> files, Configuration config)
     {
         using var httpClient = new HttpClient();
-        var maxAttempts = 60; // PoC: ~30 minutes with 30-second intervals for testing
+        var maxAttempts = config.UseUltraHighPerformanceMode ? 720 : 60; // 6 hours vs 30 minutes
+        var pollingInterval = config.UseUltraHighPerformanceMode ? 10 : 30; // 10s vs 30s intervals
         var attempt = 0;
         
-        _logger!.LogInformation($"PoC: Starting to poll migration job {jobId} (max {maxAttempts} attempts)");
+        _logger!.LogInformation($"Ultra-High Performance Polling: Job {jobId} (max {maxAttempts} attempts, {pollingInterval}s intervals)");
+        
+        var jobStopwatch = System.Diagnostics.Stopwatch.StartNew();
         
         while (attempt < maxAttempts)
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(30));
+                await Task.Delay(TimeSpan.FromSeconds(pollingInterval));
                 attempt++;
                 
                 var request = new HttpRequestMessage(HttpMethod.Get, $"https://graph.microsoft.com/v1.0/sites/{siteId}/migrate/{jobId}");
@@ -661,58 +707,79 @@ public class Program
                     var result = JsonSerializer.Deserialize<JsonElement>(responseContent);
                     var status = result.GetProperty("status").GetString();
                     
-                    _logger!.LogInformation($"PoC: Job {jobId} status: {status} (Attempt {attempt}/{maxAttempts})");
+                    // Reduced logging frequency for performance
+                    if (attempt % 10 == 0 || status is "completed" or "failed")
+                    {
+                        _logger!.LogInformation($"Ultra-High Performance Job {jobId}: {status} (Attempt {attempt}/{maxAttempts})");
+                    }
                     
                     switch (status)
                     {
                         case "completed":
+                            jobStopwatch.Stop();
                             var completedFiles = result.TryGetProperty("completedItems", out var completedProp) 
                                 ? completedProp.GetInt32() 
                                 : files.Count;
-                            _logger!.LogInformation($"PoC: Job {jobId} completed successfully - {completedFiles} files migrated");
+                            var filesPerSecond = completedFiles / (jobStopwatch.ElapsedMilliseconds / 1000.0);
+                            
+                            _logger!.LogInformation($"Ultra-High Performance Job {jobId} COMPLETED:");
+                            _logger!.LogInformation($"  - Files: {completedFiles:N0}");
+                            _logger!.LogInformation($"  - Time: {jobStopwatch.ElapsedMilliseconds / 1000.0:F1}s");
+                            _logger!.LogInformation($"  - Speed: {filesPerSecond:F1} files/second");
                             
                             foreach (var file in files)
                             {
                                 file.Status = FileStatus.Migrated;
-                                file.SharePointUrl = $"{files.First().TargetPath}"; // Will be updated with actual URL
+                                file.SharePointUrl = $"{config.DocLibrary}/{file.TargetPath}";
                             }
                             return;
                             
                         case "failed":
+                            jobStopwatch.Stop();
                             var error = result.GetProperty("error").GetString();
                             var failedItems = result.TryGetProperty("failedItems", out var failedProp) 
                                 ? failedProp.GetInt32() 
                                 : 0;
-                            _logger!.LogError($"PoC: Migration job failed: {error} ({failedItems} items failed)");
+                            
+                            _logger!.LogError($"Ultra-High Performance Job {jobId} FAILED:");
+                            _logger!.LogError($"  - Error: {error}");
+                            _logger!.LogError($"  - Failed Items: {failedItems:N0}");
+                            _logger!.LogError($"  - Time: {jobStopwatch.ElapsedMilliseconds / 1000.0:F1}s");
+                            
                             throw new Exception($"Migration job failed: {error}");
                             
                         case "inProgress":
                             var progress = result.TryGetProperty("progress", out var progressProp) 
                                 ? progressProp.GetInt32() 
                                 : 0;
-                            _logger!.LogDebug($"PoC: Job {jobId} in progress: {progress}%");
+                            
+                            // Log progress every 50 attempts for performance
+                            if (attempt % 50 == 0)
+                            {
+                                _logger!.LogDebug($"Ultra-High Performance Job {jobId}: {progress}% complete");
+                            }
                             continue;
                             
                         default:
-                            _logger!.LogWarning($"PoC: Unknown job status: {status}");
+                            _logger!.LogWarning($"Ultra-High Performance Job {jobId}: Unknown status {status}");
                             continue;
                     }
                 }
                 else
                 {
-                    _logger!.LogWarning($"PoC: Failed to poll job status: {response.StatusCode} - {responseContent}");
+                    _logger!.LogWarning($"Ultra-High Performance Job {jobId}: HTTP {response.StatusCode}");
                 }
             }
             catch (Exception ex)
             {
-                _logger!.LogError(ex, $"PoC: Error polling migration job (Attempt {attempt}/{maxAttempts})");
+                _logger!.LogError(ex, $"Ultra-High Performance Job {jobId}: Error on attempt {attempt}/{maxAttempts}");
                 if (attempt >= maxAttempts)
                     throw;
                 
-                // Don't throw on transient errors, continue polling
+                // Faster retry on transient errors
                 if (ex is HttpRequestException || ex is TaskCanceledException)
                 {
-                    _logger!.LogWarning($"PoC: Transient error polling job, continuing...");
+                    await Task.Delay(TimeSpan.FromSeconds(5)); // Quick retry
                     continue;
                 }
                 else
@@ -722,7 +789,8 @@ public class Program
             }
         }
         
-        throw new TimeoutException($"PoC: Migration job {jobId} did not complete within {maxAttempts * 30} seconds (30 minutes)");
+        jobStopwatch.Stop();
+        throw new TimeoutException($"Ultra-High Performance Job {jobId} did not complete within {maxAttempts * pollingInterval} seconds ({maxAttempts * pollingInterval / 3600.0:F1} hours)");
     }
 
     private static string ComputeFileHash(BlobFileInfo file)
@@ -840,11 +908,18 @@ public class Configuration
     public string SiteUrl { get; set; } = "";
     public string DocLibrary { get; set; } = "";
     
-    // High-performance configuration
-    public int BatchSize { get; set; } = 500;
-    public int MaxConcurrency { get; set; } = Environment.ProcessorCount * 2;
-    public TimeSpan SasTokenValidity { get; set; } = TimeSpan.FromHours(48);
-    public TimeSpan JobTimeout { get; set; } = TimeSpan.FromHours(2);
+    // Ultra-high performance configuration for 1M files
+    public int BatchSize { get; set; } = 10000; // 10K files per batch
+    public int MaxConcurrency { get; set; } = Environment.ProcessorCount * 50; // 50x CPU cores
+    public int MaxParallelBatches { get; set; } = 20; // 20 batches simultaneously
+    public TimeSpan SasTokenValidity { get; set; } = TimeSpan.FromHours(72); // 3 days for large migrations
+    public TimeSpan JobTimeout { get; set; } = TimeSpan.FromHours(6); // 6 hours per job
+    public int CopyPollingIntervalMs { get; set; } = 100; // 100ms polling vs 1s
+    public bool UseUltraHighPerformanceMode { get; set; } = true;
+    
+    // Performance metrics
+    public long TargetFilesPerHour { get; set; } = 100000; // 100K files/hour target
+    public long TargetFilesPerSecond { get; set; } = 28; // ~28 files/second sustained
 }
 
 public class BlobFileInfo
@@ -861,6 +936,33 @@ public class BlobFileInfo
     public string? SharePointUrl { get; set; }
     public string? PackageId { get; set; }
     public string? StagedBlobPath { get; set; }
+    
+    // Ultra-high performance metrics
+    public DateTime? StagingStartTime { get; set; }
+    public DateTime? StagingEndTime { get; set; }
+    public DateTime? MigrationStartTime { get; set; }
+    public DateTime? MigrationEndTime { get; set; }
+    public long StagingDurationMs => StagingEndTime.HasValue && StagingStartTime.HasValue 
+        ? (long)(StagingEndTime.Value - StagingStartTime.Value).TotalMilliseconds 
+        : 0;
+    public long MigrationDurationMs => MigrationEndTime.HasValue && MigrationStartTime.HasValue 
+        ? (long)(MigrationEndTime.Value - MigrationStartTime.Value).TotalMilliseconds 
+        : 0;
+}
+
+public class PerformanceMetrics
+{
+    public long TotalFiles { get; set; }
+    public long ProcessedFiles { get; set; }
+    public long FailedFiles { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime? EndTime { get; set; }
+    public long ElapsedMs => EndTime.HasValue ? (long)(EndTime.Value - StartTime).TotalMilliseconds : 
+        (long)(DateTime.UtcNow - StartTime).TotalMilliseconds;
+    public double FilesPerSecond => ProcessedFiles / (ElapsedMs / 1000.0);
+    public double PercentComplete => TotalFiles > 0 ? (ProcessedFiles * 100.0 / TotalFiles) : 0;
+    public long MegabytesPerSecond => ProcessedFiles > 0 ? 
+        (ProcessedFiles * 1024L * 1024L / 10) / (ElapsedMs / 1000) : 0; // Assuming 1MB avg file
 }
 
 public class MappingRule
